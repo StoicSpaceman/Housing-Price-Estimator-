@@ -1,0 +1,1017 @@
+---
+title: "Final Project"
+author: "Kate Harkleroad & Daniel Finley"
+date: "12/13/2020"
+output: html_document
+---
+***
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, error=FALSE, message=FALSE)
+```
+
+##### This document goes the code compiled to create a model that estimates the sale price of homes in Ames, IA. It goes through several sections and ends with generating a submission file. Sections: 
+* Cleaning
+* Data prep
+* Data exploration
+* Modeling
+
+#### Loading the Libraries
+```{r, warning=FALSE, error=FALSE, message=FALSE}
+library(tidyverse)
+library(rpart)
+library(rpart.plot)
+library(knitr)
+library(ggplot2)
+library(plyr)
+library(dplyr)
+library(caret)
+library(gridExtra)
+library(scales)
+library(Rmisc)
+library(ggrepel)
+library(randomForest)
+library(psych)
+library(xgboost)
+library(corrplot)
+library(reshape2)
+```
+
+#### Reading in and setting up the datasets
+```{r, warning=FALSE, error=FALSE, message=FALSE}
+train <- read_csv("train.csv")
+test <- read_csv("test.csv")
+
+#setting up train variables for binding
+trainID <- train$Id
+salePrice <- train %>%
+  select(Id, SalePrice)
+
+#setting up test variables for binding
+testID <- test$Id
+test$SalePrice <- NA
+
+#combining the test and train datasets for cleaning data purposes.
+test_train <- bind_rows(train, test)
+
+```
+
+***
+
+# Cleaning
+
+```{r}
+#Remove large NA Variables
+test_train <- test_train %>% select(-c("PoolQC", "MiscFeature", "Alley", "Fence", "Utilities"))
+
+```
+
+```{r}
+#View NA's, don't worry about SalePrice NA's, these are from the test dataset
+colSums(sapply(test_train,is.na))
+
+```
+
+***
+
+# Data Prep
+
+
+```{r}
+# setting up the qualities vector to handle ordinal data
+Qualities <- c('None' = 0, 'Po' = 1, 'Fa' = 2, 'TA' = 3, 'Gd' = 4, 'Ex' = 5)
+```
+     *  Ex	Excellent
+     *  Gd	Good 
+     *  TA	Average 
+     *  Fa	Fair 
+     *  Po	Poor 
+     *  NA	None
+
+### Fireplace variables
+
+Within Fireplace Quality, there are 1420 NAs between test and train datasets. 
+
+The number of NAs in FireplaceQu matches the number of houses with 0 fireplaces. This means that I can safely replace the NAs in FireplaceQu with 'no fireplace'. 
+
+```{r, warning=FALSE, error=FALSE, message=FALSE}
+test_train$FireplaceQu[is.na(test_train$FireplaceQu)] <- 'None'
+
+test_train$FireplaceQu<-as.integer(revalue(test_train$FireplaceQu, Qualities))
+table(test_train$FireplaceQu)
+```
+```{r, warning=FALSE, error=FALSE, message=FALSE}
+test_train %>%
+  filter(test_train$Fireplaces == 0)
+# 1420/2919
+```
+
+### Basement
+
+```{r}
+test_train <- test_train %>% 
+  mutate(BsmtExposure = ifelse(is.na(BsmtExposure), "noBsmt", BsmtExposure),
+         BsmtFinished = ifelse(BsmtUnfSF == 0 & BsmtExposure != "noBsmt", 1, 
+                                  ifelse(BsmtExposure == "noBsmt", 0, 0)))
+```
+
+***Looking at basement values with NAs***
+```{r}
+test_train %>% 
+  select(contains("Bsmt")) %>% 
+  filter(BsmtExposure == "noBsmt" & is.na(BsmtFinType1) & is.na(BsmtFinType2))
+```
+***Populating Basement NA values***
+  Changing the remaining Na values to 0 for integer variables and "noBsmt" for character variables.
+
+```{r}
+test_train[test_train$BsmtExposure == "noBsmt" & is.na(test_train$BsmtFinType1) & is.na(test_train$BsmtFinType2),] <- test_train %>%
+  filter(BsmtExposure == "noBsmt" & is.na(BsmtFinType1) & is.na(BsmtFinType2)) %>% 
+  mutate(BsmtQual = "None",
+         BsmtCond  = "None",
+         BsmtFinType1 = "None",
+         BsmtFinSF1 = 0,
+         BsmtFinType2 = "None",
+         BsmtFinSF2 = 0,
+         BsmtUnfSF = 0,
+         TotalBsmtSF = 0,
+         BsmtFullBath = 0,
+         BsmtHalfBath = 0,
+         BsmtFinished = 0)
+```
+
+***Remaining Basement Na's***
+  3 more basement variables contain NA values even though they contain basements. Will use most common data values to populate these 3 remaining variables. 
+```{r}
+#look at remaining Na's
+NAcol <- which(colSums(is.na(test_train)) > 0)
+sort(colSums(sapply(test_train[NAcol], is.na)), decreasing = TRUE)
+```
+
+```{r, warning=FALSE, error=FALSE, message=FALSE}
+#Look at Basement Variables with remaining NA's
+table(test_train$BsmtCond)
+table(test_train$BsmtQual)
+table(test_train$BsmtFinType2)
+#look at NA value
+test_train %>% select(Id, contains("Bsmt")) %>% 
+  filter(is.na(BsmtFinType2))
+
+#Populate BsmtCond NA's with most common value: TA
+test_train$BsmtCond[is.na(test_train$BsmtCond)] <- factor("TA")
+
+#Populate BsmtQual
+test_train$BsmtQual[is.na(test_train$BsmtQual)] <- factor("TA")
+
+#Populate BsmtFinType2 
+test_train$BsmtFinType2 [is.na(test_train$BsmtFinType2)] <- factor("Unf")
+
+```
+
+
+***BsmtQual: Evaluates the height of the basement***
+
+Make this variable ordinal
+
+       Ex	Excellent (100+ inches)	
+       Gd	Good (90-99 inches)
+       TA	Typical (80-89 inches)
+       Fa	Fair (70-79 inches)
+       Po	Poor (<70 inches
+       NA	No Basement
+
+```{r, warning=FALSE, error=FALSE, message=FALSE}
+test_train$BsmtQual<-as.integer(revalue(test_train$BsmtQual, Qualities))
+table(test_train$BsmtQual)
+```
+
+***BsmtCond: Evaluates the general condition of the basement***
+
+Make this variable ordinal
+
+       Ex	Excellent
+       Gd	Good
+       TA	Typical - slight dampness allowed
+       Fa	Fair - dampness or some cracking or settling
+       Po	Poor - Severe cracking, settling, or wetness
+       NA	No Basement
+
+```{r, warning=FALSE, error=FALSE, message=FALSE}
+test_train$BsmtCond<-as.integer(revalue(test_train$BsmtCond, Qualities))
+table(test_train$BsmtCond)
+```
+
+***BsmtExposure: Refers to walkout or garden level walls***
+
+Make this variable ordinal.
+
+       Gd	Good Exposure
+       Av	Average Exposure (split levels or foyers typically score average or above)	
+       Mn	Mimimum Exposure
+       No	No Exposure
+       NA	No Basement
+ 
+```{r, warning=FALSE, error=FALSE, message=FALSE}
+Exposure <- c('noBsmt'=0, 'No'=1, 'Mn'=2, 'Av'=3, 'Gd'=4)
+
+test_train$BsmtExposure<-as.integer(revalue(test_train$BsmtExposure, Exposure))
+table(test_train$BsmtExposure)
+```
+
+***BsmtFinType1: Rating of basement finished area***
+
+Make this variable ordinal.
+
+       GLQ	Good Living Quarters
+       ALQ	Average Living Quarters
+       BLQ	Below Average Living Quarters	
+       Rec	Average Rec Room
+       LwQ	Low Quality
+       Unf	Unfinshed
+       NA	No Basement
+		
+```{r, warning=FALSE, error=FALSE, message=FALSE}
+test_train$BsmtFinType1[is.na(test_train$BsmtFinType1)] <- 'None'
+FinType <- c('None'=0, 'Unf'=1, 'LwQ'=2, 'Rec'=3, 'BLQ'=4, 'ALQ'=5, 'GLQ'=6)
+
+test_train$BsmtFinType1<-as.integer(revalue(test_train$BsmtFinType1, FinType))
+table(test_train$BsmtFinType1)
+```
+
+***BsmtFinType2: Rating of basement finished area (if multiple types)***
+
+Make this variable ordinal with the FinType vector.
+
+       GLQ	Good Living Quarters
+       ALQ	Average Living Quarters
+       BLQ	Below Average Living Quarters	
+       Rec	Average Rec Room
+       LwQ	Low Quality
+       Unf	Unfinshed
+       NA	No Basement
+
+```{r, warning=FALSE, error=FALSE, message=FALSE}
+test_train$BsmtFinType2[is.na(test_train$BsmtFinType2)] <- 'None'
+FinType <- c('None'=0, 'Unf'=1, 'LwQ'=2, 'Rec'=3, 'BLQ'=4, 'ALQ'=5, 'GLQ'=6)
+
+test_train$BsmtFinType2<-as.integer(revalue(test_train$BsmtFinType2, FinType))
+table(test_train$BsmtFinType2)
+```
+
+
+
+### Lot variables
+
+3 variables. One with 1 NA, and 2 complete variables.
+
+***LotFrontage: Linear feet of street connected to property***
+
+486 NAs. The most reasonable imputation seems to take the median per neighborhood.
+
+```{r}
+ggplot(test_train[!is.na(test_train$LotFrontage),], aes(x=as.factor(Neighborhood), y=LotFrontage)) +
+        geom_bar(stat='summary', fun.y = "median", fill='blue') +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+```{r}
+for (i in 1:nrow(test_train)){
+        if(is.na(test_train$LotFrontage[i])){
+               test_train$LotFrontage[i] <- as.integer(median(test_train$LotFrontage[test_train$Neighborhood==test_train$Neighborhood[i]], na.rm=TRUE)) 
+        }
+}
+```
+
+**LotShape: General shape of property**
+
+No NAs. Values seem ordinal (Regular=best)
+
+       Reg	Regular	
+       IR1	Slightly irregular
+       IR2	Moderately Irregular
+       IR3	Irregular
+
+```{r, warning=FALSE, error=FALSE, message=FALSE}
+test_train$LotShape<-as.integer(revalue(test_train$LotShape, c('IR3'=0, 'IR2'=1, 'IR1'=2, 'Reg'=3)))
+table(test_train$LotShape)
+sum(table(test_train$LotShape))
+```
+
+**LotConfig: Lot configuration**
+
+No NAs. Factor this variable
+
+       Inside	Inside lot
+       Corner	Corner lot
+       CulDSac	Cul-de-sac
+       FR2	Frontage on 2 sides of property
+       FR3	Frontage on 3 sides of property
+       
+```{r}
+ggplot(test_train[!is.na(test_train$SalePrice),], aes(x=as.factor(LotConfig), y=SalePrice)) +
+        geom_bar(stat='summary', fun.y = "median", fill='blue')+
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma) +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..))
+```
+
+```{r, warning=FALSE, error=FALSE, message=FALSE}
+test_train$LotConfig <- as.factor(test_train$LotConfig)
+table(test_train$LotConfig)
+sum(table(test_train$LotConfig))
+```
+
+**Lot section probably is not going to be a good variable to use to predict SalesPrice **
+
+
+### Garage NAs and variables
+
+**Altogether, there are 5 variables related to garages**
+
+Variables have 157 NAs between test and train. 
+
+First of all, I am going to replace all 157 missing **GarageYrBlt: Year garage was built** values with the values in YearBuilt (this is similar to YearRemodAdd, which also defaults to YearBuilt if no remodeling or additions).
+```{r}
+#remaing NA's
+NAcol <- which(colSums(is.na(test_train)) > 0)
+sort(colSums(sapply(test_train[NAcol], is.na)), decreasing = TRUE)
+
+#Looking at all garage variables when GarageType is null
+test_train %>% 
+  filter(is.na(GarageType)) %>%
+  select(contains("garage"))
+```
+**GarageType: Garage location**
+
+Factor these variables
+
+       2Types	More than one type of garage
+       Attchd	Attached to home
+       Basment	Basement Garage
+       BuiltIn	Built-In (Garage part of house - typically has room above garage)
+       CarPort	Car Port
+       Detchd	Detached from home
+       NA	No Garage
+```{r, warning=FALSE, error=FALSE, message=FALSE}
+#Changing garage type from NA to No Garage
+test_train$GarageType[is.na(test_train$GarageType)] <- "No Garage"
+test_train$GarageType <- as.factor(test_train$GarageType)
+table(test_train$GarageType)
+
+```
+
+**GarageYrBlt**
+```{r}
+test_train$GarageYrBlt[is.na(test_train$GarageYrBlt)] <- test_train$YearBuilt[is.na(test_train$GarageYrBlt)]
+```
+
+From looking at the summary statistics, the max GarageYrBlt is 2207. Need to look in to this and change the GarageYrBlt to the value of the YearBuilt
+
+```{r}
+test_train %>% 
+  filter(GarageYrBlt > 2020) %>% 
+  select(Id, YearBuilt, GarageYrBlt)
+
+#Changing GarageYrBlt to the value of YearBuilt
+test_train$GarageYrBlt[test_train$Id == 2593] <- 2006
+
+```
+
+**GarageFinish: Interior finish of the garage**
+
+The values are ordinal.
+
+       Fin	Finished
+       RFn	Rough Finished	
+       Unf	Unfinished
+       NA	No Garage       
+```{r, warning=FALSE, error=FALSE, message=FALSE}
+test_train$GarageFinish[is.na(test_train$GarageFinish)] <- 'None'
+Finish <- c('None'=0, 'Unf'=1, 'RFn'=2, 'Fin'=3)
+
+test_train$GarageFinish<-as.integer(revalue(test_train$GarageFinish, Finish))
+table(test_train$GarageFinish)
+```
+
+
+**GarageQual: Garage quality**
+
+The values are ordinal.
+
+       Ex	Excellent
+       Gd	Good
+       TA	Typical/Average
+       Fa	Fair
+       Po	Poor
+       NA	No Garage
+       
+```{r, warning=FALSE, error=FALSE, message=FALSE}
+test_train$GarageQual[is.na(test_train$GarageQual)] <- 'None'
+test_train$GarageQual<-as.integer(revalue(test_train$GarageQual, Qualities))
+table(test_train$GarageQual)
+```
+
+**GarageCond: Garage condition**
+
+The values are ordinal.
+
+       Ex	Excellent
+       Gd	Good
+       TA	Typical/Average
+       Fa	Fair
+       Po	Poor
+       NA	No Garage
+
+```{r, warning=FALSE, error=FALSE, message=FALSE}
+test_train$GarageCond[is.na(test_train$GarageCond)] <- 'None'
+test_train$GarageCond<-as.integer(revalue(test_train$GarageCond, Qualities))
+table(test_train$GarageCond)
+```
+
+***GarageType: Garage location***
+		
+       2Types	More than one type of garage
+       Attchd	Attached to home
+       Basment	Basement Garage
+       BuiltIn	Built-In (Garage part of house - typically has room above garage)
+       CarPort	Car Port
+       Detchd	Detached from home
+       NA	No Garage: 
+       
+```{r}
+test_train <- test_train %>% 
+  mutate(GarageType = ifelse(is.na(GarageType), "noGarage", GarageType))
+```
+
+***GarageArea: Size of garage in square feet + GarageCar: Size of garage in car capacity***
+
+1 Na value for GarageArea and 1 NA for GarageCars. Both NA's on same record and Does not appear to have a garage, so setting sqft garagecars to 0
+
+
+```{r}
+test_train %>% select(Id, GarageArea, GarageType, GarageCond, GarageFinish, GarageQual) %>% 
+  filter(is.na(GarageArea))
+
+test_train$GarageArea[is.na(test_train$GarageArea)] <- 0
+
+test_train %>% select(Id, GarageArea, GarageType, GarageCond, GarageFinish, GarageQual, GarageCars) %>% 
+  filter(is.na(GarageCars))
+
+test_train$GarageCars[is.na(test_train$GarageCars)] <- 0
+
+
+
+```
+
+
+### Masonry variables
+
+**Masonry veneer type, and masonry veneer area**
+
+Masonry veneer type has 8 NAs. Masonry veneer area has 8 NAs. If a house has a veneer area, it should also have a masonry veneer type. 
+
+
+**Masonry veneer type**
+
+Will check the ordinality below.
+
+       BrkCmn	Brick Common
+       BrkFace	Brick Face
+       CBlock	Cinder Block
+       None	None
+       Stone	Stone
+
+```{r}
+test_train$MasVnrType[is.na(test_train$MasVnrType)] <- 'None'
+```
+
+There seems to be a significant difference between "common brick/none" and the other types. I assume that simple stones and for instance wooden houses are just cheaper. I will make the ordinality accordingly. 
+
+```{r, warning=FALSE, error=FALSE, message=FALSE}
+Masonry <- c('None'=0, 'BrkCmn'=0, 'BrkFace'=1, 'Stone'=2)
+test_train$MasVnrType<-as.integer(revalue(test_train$MasVnrType, Masonry))
+table(test_train$MasVnrType)
+```
+
+**MasVnrArea: Masonry veneer area in square feet**
+
+An integer variable.
+```{r}
+test_train$MasVnrArea[is.na(test_train$MasVnrArea)] <-0
+```
+
+
+
+### Electrical system
+
+**Electrical: Electrical system**
+
+1 NA. Values are categorical.
+
+       SBrkr	Standard Circuit Breakers & Romex
+       FuseA	Fuse Box over 60 AMP and all Romex wiring (Average)	
+       FuseF	60 AMP Fuse Box and mostly Romex wiring (Fair)
+       FuseP	60 AMP Fuse Box and mostly knob & tube wiring (poor)
+       Mix	Mixed
+
+```{r, warning=FALSE, error=FALSE, message=FALSE}
+#imputing mode
+test_train$Electrical[is.na(test_train$Electrical)] <- names(sort(-table(test_train$Electrical)))[1]
+
+test_train$Electrical <- as.factor(test_train$Electrical)
+table(test_train$Electrical)
+sum(table(test_train$Electrical))
+```
+
+***Functional***
+Functional: Home functionality (Assume typical unless deductions are warranted) 
+2 NA's going to assume they are Typ(Typical Functionality)
+
+```{r, warning=FALSE, error=FALSE, message=FALSE}
+summary(factor(test_train$Functional))
+
+test_train$Functional[is.na(test_train$Functional)] <- "Typ"
+
+```
+### Zoning
+***MSZoning***
+MSZoning: Identifies the general zoning classification of the sale.
+
+4NA values 
+
+```{r}
+summary(factor(test_train$MSZoning))
+
+test_train %>% 
+  filter(is.na(MSZoning)) %>%
+  select(Id, MSZoning, Neighborhood)
+```
+Creating a tree function to predict MSZoning values for Id = 1916, 2217, 2251, 2905
+```{r}
+tree.MSZoning <- rpart(MSZoning ~ ., data = test_train)
+
+test_train[is.na(test_train$MSZoning), ]$MSZoning <- predict(tree.MSZoning,
+                                                   newdata = test_train[is.na(test_train$MSZoning), ],
+                                             type = "class")
+```
+
+Look at the MSZoning Values for Id = 1916, 2217, 2251, 2905
+```{r}
+test_train %>% 
+  filter(Id == 1916 | Id == 2217 | Id == 2251 | Id == 2905) %>%
+  select(Id, MSZoning, Neighborhood)
+```
+
+### SaleType
+
+***SaleType: Type of sale***
+1 NA
+```{r, warning=FALSE, error=FALSE, message=FALSE}
+summary(factor(test_train$SaleType))
+
+test_train %>% 
+  filter(is.na(SaleType)) %>%
+  select(Id, SaleType, SaleCondition)
+
+#Setting Sale Type to WD - the most common Sale Type
+test_train$SaleType[is.na(test_train$SaleType)] <- "WD"
+
+
+```
+
+### Kitchen
+
+***Kitchen Quality***
+KitchenQual: Kitchen quality
+
+       Ex	Excellent
+       Gd	Good
+       TA	Typical/Average
+       Fa	Fair
+       Po	Poor
+       
+  1 NA value
+  
+```{r, warning=FALSE, error=FALSE, message=FALSE}
+summary(factor(test_train$KitchenQual))
+
+test_train %>% 
+  filter(is.na(KitchenQual)) %>%
+  select(Id, KitchenQual, KitchenAbvGr, OverallQual, OverallCond)
+
+#Giving KitchenQual value TA (The most common value)
+
+test_train$KitchenQual[is.na(test_train$KitchenQual)] <- "TA"
+
+#Categorical Variable to Integer
+test_train$KitchenQual<-as.integer(revalue(test_train$KitchenQual, Qualities))
+table(test_train$KitchenQual)
+```
+
+### Exterior 
+
+***Exterior1st & Exterior2nd***
+Exterior1st: Exterior covering on house
+
+       AsbShng	Asbestos Shingles
+       AsphShn	Asphalt Shingles
+       BrkComm	Brick Common
+       BrkFace	Brick Face
+       CBlock	Cinder Block
+       CemntBd	Cement Board
+       HdBoard	Hard Board
+       ImStucc	Imitation Stucco
+       MetalSd	Metal Siding
+       Other	Other
+       Plywood	Plywood
+       PreCast	PreCast	
+       Stone	Stone
+       Stucco	Stucco
+       VinylSd	Vinyl Siding
+       Wd Sdng	Wood Siding
+       WdShing	Wood Shingles
+	
+Exterior2nd: Exterior covering on house (if more than one material)
+
+       AsbShng	Asbestos Shingles
+       AsphShn	Asphalt Shingles
+       BrkComm	Brick Common
+       BrkFace	Brick Face
+       CBlock	Cinder Block
+       CemntBd	Cement Board
+       HdBoard	Hard Board
+       ImStucc	Imitation Stucco
+       MetalSd	Metal Siding
+       Other	Other
+       Plywood	Plywood
+       PreCast	PreCast
+       Stone	Stone
+       Stucco	Stucco
+       VinylSd	Vinyl Siding
+       Wd Sdng	Wood Siding
+       WdShing	Wood Shingles
+       
+  1 NA on both Exterior1st and Exterior2nd
+  
+  
+```{r, warning=FALSE, error=FALSE, message=FALSE}
+summary(factor(test_train$Exterior1st))
+summary(factor(test_train$Exterior2nd))
+
+test_train %>% 
+  filter(is.na(Exterior1st)) %>%
+  select(Id, Exterior1st, Exterior2nd)
+
+#NA's for Exterior1st and Exterior2nd are on the same record
+#Setting values to the most common values
+
+test_train$Exterior1st[is.na(test_train$Exterior1st)] <- "VinylSd"
+test_train$Exterior2nd[is.na(test_train$Exterior2nd)] <- "VinylSd"
+
+
+```
+Exterior Quality
+```{r}
+test_train$ExterQual<-as.integer(revalue(test_train$ExterQual, Qualities))
+table(test_train$ExterQual)
+```
+### Street
+```{r}
+#Street
+test_train$Street <- ifelse(test_train$Street=="Pave", 1, 0)
+
+```
+
+	
+
+```{r}
+colSums(sapply(test_train,is.na))
+
+```
+
+### Data Prep Summary: 
+That takes care of all of the NAs. We have also manipulated a lot of the data to make it easier to use. This next section will take a deeper look at the data we have prepped. 
+
+
+
+# Data Exploration
+
+**1. Take a look at the OverallQual Variable**
+```{r}
+test_train %>% 
+  ggplot(aes(x = OverallQual, y = SalePrice)) +
+  geom_point() +
+  geom_smooth() +
+  xlab("Overall Quality")
+```
+
+
+**2. Neighborhood**
+```{r}
+#table(test_train$Neighborhood)
+
+ggplot(test_train[!is.na(test_train$SalePrice),], aes(x=Neighborhood, y=SalePrice)) +
+        geom_bar(stat='summary', fun = "median", fill='blue') +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+        scale_y_continuous(breaks= seq(0, 800000, by=50000), labels = comma) +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..), size=3) +
+        geom_hline(yintercept=163000, linetype="dashed", color = "red") #->median sales price
+
+#binning
+ggplot(test_train[!is.na(test_train$SalePrice),], aes(x=reorder(Neighborhood, SalePrice, FUN=mean), y=SalePrice)) +
+        geom_bar(stat='summary', fun = "mean", fill='blue') + labs(x='Neighborhood', y="Mean SalePrice") +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+        scale_y_continuous(breaks= seq(0, 800000, by=50000), labels = comma) +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..), size=3) +
+        geom_hline(yintercept=163000, linetype="dashed", color = "red") #->median sales price
+```
+*The red dotted line shows the overall median price and the blue bars illustrate the median price per neighborhood. You can see here that there are a few neighborhoods where you can get a much high or lower sales price.*
+
+**3. GrLivArea**
+```{r}
+#table(test_train$GrLivArea)
+test_train %>% 
+  ggplot(aes(x = GrLivArea, y = SalePrice)) +
+  geom_point() +
+  geom_smooth() +
+  xlab("Above Ground Living Area")
+```
+
+**4. 1stFlrSF**
+```{r}
+test_train %>% 
+  ggplot(aes(x = `1stFlrSF`, y = SalePrice)) +
+  geom_point() +
+  geom_smooth() +
+  xlab("First Floor Sqft")
+```
+
+*There is an outlier here we may want to remove. *
+
+**5. TotalBsmtSF**
+```{r}
+#table(test_train$TotalBsmtSF)
+test_train %>% 
+  ggplot(aes(x = `TotalBsmtSF`, y = SalePrice)) +
+  geom_point() +
+  geom_smooth() +
+  xlab("Total Basement Sqft")
+```
+
+*Looks like possibly the same outlier?*
+
+
+**6.Bathrooms**
+
+*Combining bathroom variables and looking at their relationship to SalePrice*
+
+```{r}
+test_train <- test_train %>% 
+  mutate(FullBath = as.numeric(FullBath),
+         HalfBath = as.numeric(HalfBath * .5),
+         BsmtFullBath = as.numeric(BsmtFullBath),
+         BsmtHalfBath = as.numeric(BsmtHalfBath * .5),
+         TotalBaths = as.numeric(FullBath + BsmtFullBath + HalfBath + BsmtHalfBath))
+```
+
+*Plotting new Total Bathroom variable*
+
+```{r}
+  ggplot(data = test_train, aes(x = TotalBaths, y = SalePrice)) +
+  geom_point() + geom_smooth()
+```
+
+*There is that pesky outlier again*
+
+**7. Total Home SQFT**
+
+```{r}
+#TotalBsmtSF, 1stFlrSF, 2ndFlrSF
+
+test_train <- test_train %>%
+  mutate(TotalSqft = TotalBsmtSF + `1stFlrSF` + `2ndFlrSF`)
+
+#Plot Total Square Feet against SalePrice
+
+ggplot(data = test_train, aes(x = TotalSqft, y = SalePrice)) + geom_point(col='black') + geom_smooth() + scale_y_continuous(breaks = seq(0, 800000, by = 100000), labels = comma)
+
+#Plot 2
+ggplot(data = test_train, aes(x = TotalSqft, y = SalePrice)) + geom_point(col='black') + geom_smooth(method = lm) + scale_y_continuous(breaks = seq(0, 800000, by = 100000), labels = comma)
+
+
+```
+
+
+ *Outlier IDs: 524 and 1299. *
+
+
+**8. House age**
+```{r, fig.width= 7, fig.height=10}
+test_train$Age <- as.numeric(test_train$YrSold)-test_train$YearRemodAdd
+
+
+h1 <- ggplot(data=test_train[!is.na(test_train$SalePrice),], aes(x=Age, y=SalePrice))+
+        geom_point(col='blue') + geom_smooth(method = "lm", se=FALSE, color="black", aes(group=1)) +
+        scale_y_continuous(breaks= seq(0, 800000, by=100000), labels = comma)
+
+#New houses
+test_train$IsNew <- ifelse(test_train$YrSold==test_train$YearBuilt, 1, 0)
+table(test_train$IsNew)
+
+hnew <- ggplot(test_train[!is.na(test_train$SalePrice),], aes(x=as.factor(IsNew), y=SalePrice)) +
+        geom_bar(stat='summary', fun.y = "median", fill='blue') +
+        geom_label(stat = "count", aes(label = ..count.., y = ..count..), size=6) +
+        scale_y_continuous(breaks= seq(0, 800000, by=50000), labels = comma) +
+        theme_grey(base_size = 18) +
+        geom_hline(yintercept=163000, linetype="dashed") #dashed line is median SalePrice
+
+grid.arrange(h1, hnew)
+```
+
+*Downward trend in house age as to be expected. *
+
+
+**Some additional plots**
+```{r}
+#Plot Age vs SalePrice
+ggplot(data = test_train, aes(x = Age, y = SalePrice)) + geom_point() + geom_smooth(method = lm)
+
+#Plot Kitchen Qual vs SalePrice
+ggplot(data = test_train, aes(x = KitchenQual, y = SalePrice)) + geom_point() + geom_smooth(method = lm)
+
+#Plot 1st Floor Sqft vs SalePrice
+ggplot(data = test_train, aes(x = `1stFlrSF`, y = SalePrice)) + geom_point() + geom_smooth(method = lm)
+
+#Plot Basement Qual vs Sale Price
+ggplot(data = test_train, aes(x = BsmtQual, y = SalePrice)) + geom_point() + geom_smooth(method = lm)
+
+#Plot Garage Cars vs Sale Price
+ggplot(data = test_train, aes(x = GarageCars, y = SalePrice)) + geom_point() + geom_smooth(method = lm)
+
+#Plot total rooms above ground
+ggplot(data = test_train, aes(x = TotRmsAbvGrd, y = SalePrice)) + geom_point() + geom_smooth(method = lm)
+
+#Plot Exterior Quality vs Sale Price
+ggplot(data = test_train, aes(x = ExterQual, y = SalePrice)) + geom_point() + geom_smooth(method = lm)
+
+ggplot(data = test_train, aes(x = Street, y = SalePrice)) + geom_point() + geom_smooth(method = lm)
+```
+
+
+
+*Remove outliers*
+```{r}
+test_train <- test_train[-c(524, 1299),]
+```
+
+```{r}
+(saleprice_tree <- rpart(SalePrice~. , data = test_train))
+
+rpart.plot(saleprice_tree)
+```
+
+**Our current top contenders: OverallQual, Neighboorhood, 1stFlrSF, GrLivArea, BsmtFinSF1 **
+
+
+
+### Exploring Correlation: Dropping highlly correlated values: 
+
+```{r, fig.height=7, fig.width=7}
+numericVars <- which(sapply(test_train, is.numeric)) #index vector numeric variables
+numericVarNames <- names(numericVars) #saving names vector for use later on
+cat('There are', length(numericVars), 'numeric variables')
+
+all_numVar <- test_train[, numericVars]
+cor_numVar <- cor(all_numVar, use="pairwise.complete.obs") #correlations of all numeric variables
+
+#sort on decreasing correlations with SalePrice
+cor_sorted <- as.matrix(sort(cor_numVar[,'SalePrice'], decreasing = TRUE))
+ #select only high corelations
+CorHigh <- names(which(apply(cor_sorted, 1, function(x) abs(x)>0.5)))
+cor_numVar <- cor_numVar[CorHigh, CorHigh]
+
+corrplot.mixed(cor_numVar, tl.col="black", tl.pos = "lt", tl.cex = 0.7,cl.cex = .7, number.cex=.7)
+```
+
+*If two variables are highly correlated, drop the variable with a lower correlation with SalePrice: *
+
+* GarageArea + GarageCars = drop GarageArea (0.62)
+* GrLivArea + TotalSqFeet = drop GrLivArea
+* 1stFlrSF + TotalBsmtArea = tie
+* GarageYrBlt + Year Built = drop GarageYrBlt
+* YearRemodAdd + Age = d YearRemodAdd
+* TotalSqFeet + TotalBsmtSF = drop TotalBsmtSF
+* total area and rooms above = drop TotRmsAbvGrd
+
+```{r}
+dropVars <- c('GarageArea', 'GrLivArea', 'GarageYrBlt', 'YearRemodAdd', 'TotalBsmtSF' )
+
+test_train <- test_train[,!(names(test_train) %in% dropVars)]
+```
+
+# Modeling
+
+***Splitting the data back in to test and train datasets***
+```{r}
+train <- test_train %>% 
+  filter(Id %in% trainID) 
+test <- test_train %>% 
+  filter(Id %in% testID) %>% 
+  select(-SalePrice)
+```
+
+# Looking at the distrubtion of Sales Price
+```{r}
+ggplot(data = train, aes(x= SalePrice)) + geom_histogram()
+```
+
+*Sale Price distribution slightly skewed will log sale price in model*
+
+
+**Setting up the linear regression model and removing the Id variable from the train set**
+```{r}
+train <- train%>%
+  select(-Id)
+
+lm_model_1 <- lm(log(SalePrice) ~. , data = train)
+
+summary(lm_model_1)
+```
+
+***Testing with limited variables***
+```{r}
+
+lm_model_2 <- lm(log(SalePrice) ~ Age+KitchenQual+
+                   BsmtQual+TotRmsAbvGrd+
+                   ExterQual+TotalSqft+
+                   YearBuilt+TotalBaths+OverallQual, data = train)
+summary(lm_model_2)
+
+
+#RMSE
+prediction <- predict(lm_model_2, train, type="response")
+model_output <- cbind(train, prediction)
+
+model_output$log_prediction <- log(model_output$prediction)
+model_output$log_SalePrice <- log(model_output$SalePrice)
+
+#Test with RMSE
+
+#rmse(model_output$log_SalePrice,model_output$log_prediction)
+```
+Testing with Random forest
+```{r}
+#model_1 <- randomForest(SalePrice ~ ., data=train)
+
+
+# Predict using the test set
+#prediction <- predict(model_1, test)
+#model_output <- cbind(test, prediction)
+
+
+#model_output$log_prediction <- log(model_output$prediction)
+#model_output$log_SalePrice <- log(model_output$SalePrice)
+
+#Test with RMSE
+
+#rmse(model_output$log_SalePrice,model_output$log_prediction)
+```
+
+
+```{r}
+#RMSE
+rmse <- function(actual, fitted){
+  sqrt(mean((actual - fitted)^2))
+}
+
+rmse(train$SalePrice, fitted(lm_model_1))
+# need to exponentiate the log value
+rmse(train$SalePrice, exp(fitted(lm_model_1)))
+```
+
+
+Prepare the prediction data
+```{r}
+predicted_prices <- exp(predict(lm_model_1, newdata = test))
+predicted_prices2 <- exp(predict(lm_model_2, newdata = test))
+
+#Quick Look
+head(predicted_prices)
+head(predicted_prices2)
+```
+
+Prepare Submission File
+```{r}
+# create a dataframe with our results
+our_submission <- tibble('Id' = as.integer(test$Id), 'SalePrice' = predicted_prices)
+our_submission2 <- tibble('Id' = as.integer(test$Id), 'SalePrice' = predicted_prices2)
+
+# save our file
+write_csv(our_submission2, 'submission7.csv')
+
+head(our_submission)
+summary(our_submission)
+head(our_submission2)
+
+```
+```
+
